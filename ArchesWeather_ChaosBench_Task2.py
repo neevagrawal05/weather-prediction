@@ -131,7 +131,7 @@ torch.manual_seed(SEED)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print('Device:', device)
 if device.type == 'cuda':
-    print('GPU       :', torch.cuda.get_device_name(0))
+    print('GPU        :', torch.cuda.get_device_name(0))
     print('GPU memory:', round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2), 'GB')
 print('ROOT:', ROOT)
 
@@ -201,10 +201,10 @@ class SpectralDivergenceLoss(nn.Module):
         n_bins = int(bins.max().item()) + 1
         counts = torch.zeros(n_bins)
         counts.scatter_add_(0, bins.reshape(-1), valid.reshape(-1).float())
-        self.register_buffer('bins',   bins.reshape(-1),       persistent=False)
+        self.register_buffer('bins',   bins.reshape(-1),        persistent=False)
         self.register_buffer('valid',  valid.reshape(-1).float(), persistent=False)
-        self.register_buffer('counts', counts.clamp_min(1.0),  persistent=False)
-        self.register_buffer('keep',   counts > 0,             persistent=False)
+        self.register_buffer('counts', counts.clamp_min(1.0),   persistent=False)
+        self.register_buffer('keep',   counts > 0,              persistent=False)
         self.n_bins = n_bins
 
     def _pdf(self, x, mask):
@@ -798,8 +798,8 @@ sample = next(iter(train_loader))
 trace('data.batch.x', sample['x'], '[B, 2, 121, 240]')
 trace('data.batch.y', sample['y'], '[B, T, 2, 121, 240]')
 print('Train pairs :', len(train_ds), '| Val pairs:', len(val_ds))
-print('x shape     :', tuple(sample['x'].shape))
-print('y shape     :', tuple(sample['y'].shape))
+print('x shape      :', tuple(sample['x'].shape))
+print('y shape      :', tuple(sample['y'].shape))
 
 
 # ==============================================================================
@@ -1031,7 +1031,7 @@ lead_to_plot = min(14, ROLLOUT_DAYS)
 fig, axs = plt.subplots(2, 3, figsize=(14, 7))
 for ch, var in enumerate(VAR_NAMES):
     p = prediction_np[0, lead_to_plot - 1, ch]
-    y = target_np   [0, lead_to_plot - 1, ch]
+    y = target_np    [0, lead_to_plot - 1, ch]
     e = p - y
     for ax, arr, title in zip(
         axs[ch],
