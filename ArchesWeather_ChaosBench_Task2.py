@@ -54,7 +54,7 @@ MODEL_KIND = 'arches'   # 'compact' or 'arches'
 # Real ChaosBench settings — keep False until you have enough storage.
 DOWNLOAD_CHAOSBENCH              = True
 STREAM_EXTRACT_SMALL_REAL_SUBSET = True
-REAL_STORES_PER_YEAR             = 75
+REAL_STORES_PER_YEAR             = 365
 REAL_CONTIGUOUS_START_DOY        = 1
 CLEAN_OLD_CHAOSBENCH_DOWNLOAD    = True
 USE_GOOGLE_DRIVE                 = False
