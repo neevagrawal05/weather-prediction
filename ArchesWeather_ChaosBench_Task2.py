@@ -9,6 +9,17 @@ Output:     Prediction tensor, metrics CSV, plots, and explicit tensor-shape tra
 NOTE: Defaults to RUN_MODE = 'real' with MODEL_KIND = 'arches'.
       Switch to RUN_MODE = 'demo' for a quick full-pipeline demonstration
       that runs on any machine without large ERA5 data.
+
+CHANGES (365-day extraction):
+  - REAL_STORES_PER_YEAR raised from 75 → 365 (full calendar year)
+  - ROLLOUT_DAYS raised from 14 → 60 for real mode (full S2S horizon)
+  - EVAL_LEADS expanded to [1,7,14,30,45,60] for both modes
+  - MAX_TRAIN_PAIRS  140 → 700  (real)
+  - MAX_VAL_PAIRS     50 → 300  (real)
+  - MAX_STATS_SAMPLES 150 → 365 (real)
+  - MAX_EVAL_INITIAL_CONDITIONS 5 → 20 (real)
+  - ChainedHTTPStream._open_next: graceful 404-skip so extended chunk list is safe
+  - ERA5 tarball URL list expanded from ['aa','ab'] → ['aa'..'az']
 """
 
 # ==============================================================================
@@ -51,15 +62,18 @@ print('Dependencies installed.')
 RUN_MODE   = 'real'     # 'demo' or 'real'
 MODEL_KIND = 'arches'   # 'compact' or 'arches'
 
-# Real ChaosBench settings — keep False until you have enough storage.
+# Real ChaosBench settings.
+# CHANGED: REAL_STORES_PER_YEAR 75 → 365  (download the full calendar year)
+# Ensure sufficient disk space (~50–100 GB for 3 years × 365 stores).
+# Set USE_GOOGLE_DRIVE = True if Colab local disk is insufficient.
 DOWNLOAD_CHAOSBENCH              = True
 STREAM_EXTRACT_SMALL_REAL_SUBSET = True
-REAL_STORES_PER_YEAR             = 365
+REAL_STORES_PER_YEAR             = 365   # ← CHANGED: was 75; now full 365-day year
 REAL_CONTIGUOUS_START_DOY        = 1
 CLEAN_OLD_CHAOSBENCH_DOWNLOAD    = True
 USE_GOOGLE_DRIVE                 = False
 
-# Training controls. Increase epochs for better real-data results.
+# Training controls.
 EPOCHS              = 16  if RUN_MODE == 'demo' else 8
 BATCH_SIZE          = 8   if RUN_MODE == 'demo' else 1
 LEARNING_RATE       = 3e-4 if RUN_MODE == 'demo' else 5e-4
@@ -68,14 +82,24 @@ SPECTRAL_WEIGHT     = 0.03 if RUN_MODE == 'demo' else 0.01
 TRAIN_ROLLOUT_STEPS = 4   if RUN_MODE == 'demo' else 2
 MAX_DELTA           = 0.25
 STATE_CLAMP         = 3.0  if RUN_MODE == 'demo' else 6.0
-ROLLOUT_DAYS        = 60   if RUN_MODE == 'demo' else 14
-EVAL_LEADS          = [1, 7, 14, 30, 45, 60] if RUN_MODE == 'demo' else [1, 7, 14]
 
-# Pair / sample limits (remove or increase for paper-quality runs).
-MAX_TRAIN_PAIRS              = 800 if RUN_MODE == 'demo' else 140
-MAX_VAL_PAIRS                = 80  if RUN_MODE == 'demo' else 50
-MAX_STATS_SAMPLES            = 80  if RUN_MODE == 'demo' else 150
-MAX_EVAL_INITIAL_CONDITIONS  = 8   if RUN_MODE == 'demo' else 5
+# CHANGED: ROLLOUT_DAYS real mode 14 → 60
+# With 365 daily stores available, the full 60-day S2S horizon is now supported.
+ROLLOUT_DAYS = 60   # ← CHANGED: both modes now use 60-day rollout
+
+# CHANGED: EVAL_LEADS real mode [1,7,14] → [1,7,14,30,45,60]
+EVAL_LEADS = [1, 7, 14, 30, 45, 60]  # ← CHANGED: full lead set for both modes
+
+# Pair / sample limits.
+# CHANGED: real-mode ceilings lifted to match full-year data availability.
+#   With 365 stores and TRAIN_ROLLOUT_STEPS=2 (needs 3 consecutive files):
+#     ~363 pairs/year × 2 train years ≈ 726 max; capped at 700.
+#   With 365 stores and ROLLOUT_DAYS=60 (needs 61 consecutive files):
+#     ~305 pairs/year for val; capped at 300.
+MAX_TRAIN_PAIRS              = 800 if RUN_MODE == 'demo' else 700  # ← CHANGED: was 140
+MAX_VAL_PAIRS                = 80  if RUN_MODE == 'demo' else 300  # ← CHANGED: was 50
+MAX_STATS_SAMPLES            = 80  if RUN_MODE == 'demo' else 365  # ← CHANGED: was 150
+MAX_EVAL_INITIAL_CONDITIONS  = 8   if RUN_MODE == 'demo' else 20   # ← CHANGED: was 5
 
 TRAIN_YEARS = ['2016', '2017']
 VAL_YEARS   = ['2018']
@@ -281,6 +305,8 @@ class DemoS2SDataset(Dataset):
 
 
 # ── Streaming multi-URL downloader ────────────────────────────────────────────
+# CHANGED: _open_next now skips 404 responses gracefully, so the extended
+# chunk list ('aa'..'az') is safe — missing chunks are simply skipped.
 class ChainedHTTPStream:
     def __init__(self, urls, chunk_size: int = 8 * 1024 * 1024):
         import requests
@@ -293,12 +319,18 @@ class ChainedHTTPStream:
         self.url_idx    = -1
 
     def _open_next(self):
+        # CHANGED: skip 404 responses so non-existent chunks are ignored
         self.url_idx += 1
         if self.url_idx >= len(self.urls):
             return False
         url = self.urls[self.url_idx]
         print(f'Streaming ChaosBench chunk {self.url_idx + 1}/{len(self.urls)}: {url.split("/")[-1]}')
         self.response = self.session.get(url, stream=True)
+        if self.response.status_code == 404:
+            print(f'  Chunk not found (404), skipping: {url.split("/")[-1]}')
+            self.response.close()
+            self.response = None
+            return self._open_next()   # try the next URL
         self.response.raise_for_status()
         self.iterator = self.response.iter_content(chunk_size=self.chunk_size)
         return True
@@ -337,7 +369,7 @@ def _date_from_zarr_root(root) -> 'pd.Timestamp | None':
     return None if m is None else pd.to_datetime(m.group(1), format='%Y%m%d')
 
 
-def _target_dates_for_years(years, start_doy: int = 1, days_per_year: int = 45) -> dict:
+def _target_dates_for_years(years, start_doy: int = 1, days_per_year: int = 365) -> dict:
     targets = {}
     for year in years:
         start = pd.Timestamp(int(year), 1, 1) + pd.Timedelta(days=int(start_doy) - 1)
@@ -389,7 +421,7 @@ def cleanup_old_full_download(data_dir) -> None:
                 print('Deleted old full-download file:', p)
 
 
-def download_chaosbench_era5(data_dir, years, max_stores_per_year: int = 45,
+def download_chaosbench_era5(data_dir, years, max_stores_per_year: int = 365,
                               start_doy: int = 1, stream_small_subset: bool = True,
                               clean_old: bool = True):
     from huggingface_hub import hf_hub_url
@@ -410,7 +442,7 @@ def download_chaosbench_era5(data_dir, years, max_stores_per_year: int = 45,
                 existing_dates.add(d.strftime('%Y%m%d'))
         existing_ok = existing_ok and target_dates[y].issubset(existing_dates)
     if existing_ok:
-        print('Small real subset already exists:', era5_dir)
+        print('Full 365-day subset already exists:', era5_dir)
         return data_dir
 
     if not stream_small_subset:
@@ -419,18 +451,30 @@ def download_chaosbench_era5(data_dir, years, max_stores_per_year: int = 45,
             'Use stream_small_subset=True.'
         )
 
+    # CHANGED: expanded from ['aa', 'ab'] → ['aa'..'az'] so the streamer can
+    # reach all daily zarr files across the full calendar year.
+    # Non-existent chunk suffixes are silently skipped (404-safe; see _open_next).
+    chunk_suffixes = [
+        f'{chr(a)}{chr(b)}'
+        for a in range(ord('a'), ord('z') + 1)
+        for b in range(ord('a'), ord('z') + 1)
+    ][:26]   # 'aa' … 'az'  — extend further (e.g. [:52] for 'aa'..'bz') if needed
     urls = [
         hf_hub_url(repo_id='LEAP/ChaosBench', repo_type='dataset',
                    filename=f'era5/era5_chunks.tar.gz.{s}')
-        for s in ['aa', 'ab']
+        for s in chunk_suffixes
     ]
+
     selected       = {y: [] for y in years}
     selected_roots = set()
     stream         = ChainedHTTPStream(urls)
 
-    print(f'Extracting contiguous windows: {max_stores_per_year} daily zarr stores '
+    print(f'Extracting full 365-day windows: {max_stores_per_year} daily zarr stores '
           f'per year from day-of-year {start_doy}.')
-    print('Streams remote tarballs and writes only selected date-window zarr stores to disk.')
+    print('Streams remote tarballs; writes only the selected date-window zarr stores to disk.')
+    print(f'NOTE: Downloading {max_stores_per_year} × {len(years)} = '
+          f'{max_stores_per_year * len(years)} daily stores. '
+          'This may take significant time and disk space (~50–100 GB for 3 years).')
 
     with tarfile.open(fileobj=stream, mode='r|gz') as tar:
         done_after_current_root = False
@@ -469,8 +513,10 @@ def download_chaosbench_era5(data_dir, years, max_stores_per_year: int = 45,
         missing = sorted(target_dates[y] - got_dates)
         if missing:
             raise RuntimeError(
-                f'Missing {len(missing)} requested contiguous dates for {y}; '
-                f'first missing: {missing[:5]}'
+                f'Missing {len(missing)} requested dates for {y}; '
+                f'first missing: {missing[:5]}. '
+                f'The tarball may need more chunk suffixes beyond "az". '
+                f'Extend chunk_suffixes in download_chaosbench_era5() to cover more chunks.'
             )
     return data_dir
 
@@ -508,13 +554,14 @@ def extract_headline_fields(path) -> np.ndarray:
         ds.close()
 
 
-def compute_stats(files, max_samples: int = 80) -> NormStats:
+def compute_stats(files, max_samples: int = 365) -> NormStats:
+    # CHANGED: default max_samples raised to 365 to cover full-year statistics
     total    = np.zeros(2)
     total2   = np.zeros(2)
     count    = np.zeros(2)
     clim_sum = np.zeros((2, GRID_H, GRID_W))
     clim_cnt = np.zeros((2, GRID_H, GRID_W))
-    for path in tqdm(files[:max_samples], desc='Computing normalisation stats'):
+    for path in tqdm(files[:max_samples], desc='Computing normalisation stats (365-day)'):
         arr   = extract_headline_fields(path).astype('float64')
         valid = np.isfinite(arr)
         safe  = np.where(valid, arr, 0.0)
@@ -558,6 +605,8 @@ class ChaosBenchZarrTask2(Dataset):
                 'No contiguous daily sequences found. '
                 'Increase REAL_STORES_PER_YEAR or clean/re-extract data.'
             )
+        print(f'  Built {len(self.sequences)} contiguous sequences '
+              f'(rollout_steps={rollout_steps}, max_pairs={max_pairs})')
 
     def __len__(self):
         return len(self.sequences)
@@ -746,6 +795,7 @@ def build_archesweather_s_wrapper():
 # ==============================================================================
 
 print('\n--- Building data loaders ---')
+print(f'REAL_STORES_PER_YEAR = {REAL_STORES_PER_YEAR}  (full 365-day year)')
 
 if RUN_MODE == 'demo':
     stats    = NormStats([0.0, 0.0], [1.0, 1.0],
@@ -757,7 +807,7 @@ else:
         download_chaosbench_era5(
             DATA_DIR,
             years=sorted(set(TRAIN_YEARS + VAL_YEARS)),
-            max_stores_per_year=REAL_STORES_PER_YEAR,
+            max_stores_per_year=REAL_STORES_PER_YEAR,   # 365
             start_doy=REAL_CONTIGUOUS_START_DOY,
             stream_small_subset=STREAM_EXTRACT_SMALL_REAL_SUBSET,
             clean_old=CLEAN_OLD_CHAOSBENCH_DOWNLOAD,
@@ -774,7 +824,7 @@ else:
         stats  = NormStats(z['mean'].tolist(), z['std'].tolist(), z['climatology'])
         print('Loaded cached normalisation stats:', stats_file)
     else:
-        stats = compute_stats(train_files, MAX_STATS_SAMPLES)
+        stats = compute_stats(train_files, MAX_STATS_SAMPLES)   # now 365
         np.savez_compressed(
             stats_file,
             mean=np.array(stats.mean),
@@ -787,7 +837,7 @@ else:
         train_files, stats, rollout_steps=TRAIN_ROLLOUT_STEPS, max_pairs=MAX_TRAIN_PAIRS
     )
     val_ds = ChaosBenchZarrTask2(
-        val_files, stats, rollout_steps=ROLLOUT_DAYS, max_pairs=MAX_VAL_PAIRS
+        val_files, stats, rollout_steps=ROLLOUT_DAYS, max_pairs=MAX_VAL_PAIRS   # 60-day rollout
     )
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
@@ -901,8 +951,11 @@ print(pd.DataFrame(history).to_string(index=False))
 # ==============================================================================
 # Prediction tensor shape: [N_initial_conditions, rollout_days, 2, 121, 240]
 # Metrics: RMSE, Bias, ACC, MS-SSIM, Spectral Divergence at selected lead days.
+# CHANGED: rollout now covers 60 days; EVAL_LEADS covers [1,7,14,30,45,60].
 
 print('\n--- Autoregressive evaluation ---')
+print(f'Rollout days: {ROLLOUT_DAYS} | Eval leads: {EVAL_LEADS}')
+print(f'Initial conditions: {MAX_EVAL_INITIAL_CONDITIONS}')
 
 
 def compute_msssim_np(p: np.ndarray, y: np.ndarray) -> float:
@@ -955,17 +1008,17 @@ def rollout_one(x0: torch.Tensor, days: int) -> torch.Tensor:
 
 
 predictions, targets, rows = [], [], []
-n_eval = min(MAX_EVAL_INITIAL_CONDITIONS, len(val_ds))
+n_eval = min(MAX_EVAL_INITIAL_CONDITIONS, len(val_ds))   # now up to 20
 clim   = stats.climatology
 
 for i in tqdm(range(n_eval), desc='rollout'):
     item = val_ds[i]
-    pred = rollout_one(item['x'], ROLLOUT_DAYS)
+    pred = rollout_one(item['x'], ROLLOUT_DAYS)           # 60 steps
     targ = item['y'][:ROLLOUT_DAYS]
     trace('eval.prediction_tensor_one_ic', pred, '[rollout_days, 2, 121, 240]')
     predictions.append(pred.numpy())
     targets.append(targ.numpy())
-    for lead in EVAL_LEADS:
+    for lead in EVAL_LEADS:                               # [1,7,14,30,45,60]
         if lead <= pred.shape[0]:
             for ch, name in enumerate(VAR_NAMES):
                 row = {'initial_condition': i}
@@ -1055,11 +1108,12 @@ with open(OUT_DIR / 'shape_trace.json', 'w') as f:
 with open(OUT_DIR / 'model_parameters.json', 'w') as f:
     json.dump(
         {
-            'params':      param_info,
-            'run_mode':    RUN_MODE,
-            'model_kind':  MODEL_KIND,
-            'rollout_days': ROLLOUT_DAYS,
-            'eval_leads':  EVAL_LEADS,
+            'params':               param_info,
+            'run_mode':             RUN_MODE,
+            'model_kind':           MODEL_KIND,
+            'rollout_days':         ROLLOUT_DAYS,
+            'eval_leads':           EVAL_LEADS,
+            'real_stores_per_year': REAL_STORES_PER_YEAR,
         },
         f, indent=2,
     )
@@ -1083,19 +1137,37 @@ print('  task2_model.pt')
 
 
 # ==============================================================================
-# BLOCK 13: Instructions — Moving from Demo to Real ChaosBench
+# BLOCK 13: Instructions — Full 365-Day Setup
 # ==============================================================================
 """
-To switch from demo to the official benchmark:
+Changes made for 365-day data extraction
+-----------------------------------------
+PARAMETER                  BEFORE   AFTER    REASON
+REAL_STORES_PER_YEAR         75      365     Download every calendar day
+ROLLOUT_DAYS (real)          14       60     Full S2S horizon now supported
+EVAL_LEADS (real)      [1,7,14]  [1,7,14,   Complete lead-time profile
+                                  30,45,60]
+MAX_TRAIN_PAIRS (real)       140      700    ~363 seqs/year × 2 years
+MAX_VAL_PAIRS (real)          50      300    ~305 seqs (61-day window) / year
+MAX_STATS_SAMPLES (real)     150      365    Full-year normalisation stats
+MAX_EVAL_INITIAL_CONDITIONS    5       20    More robust metric estimates
 
-1.  Set  RUN_MODE = 'real'
-2.  Set  USE_GOOGLE_DRIVE = True  (if Colab local disk is too small)
-3.  Set  DOWNLOAD_CHAOSBENCH = True  (first run only — streams ERA5 tarballs)
-4.  Keep MODEL_KIND = 'compact' to verify data loading first.
-5.  Then try MODEL_KIND = 'arches' for frozen ArchesWeather-S features.
-6.  Increase EPOCHS, MAX_TRAIN_PAIRS, MAX_EVAL_INITIAL_CONDITIONS
-    for report-quality results.
+Streaming / download changes
+-----------------------------
+* ChainedHTTPStream._open_next now skips 404 responses gracefully, so the
+  tarball chunk list can be safely extended without crashing on missing files.
+* The URL chunk list is expanded from ['aa','ab'] to 'aa'..'az' (26 suffixes).
+  If the error "Missing N requested dates" appears, extend chunk_suffixes
+  further (e.g. up to 'bz') inside download_chaosbench_era5().
 
-Demo-mode numbers are pipeline-validation only.
+Disk / runtime considerations
+------------------------------
+* 365 stores × 3 years (2016–2018) ≈ 1095 zarr files.
+  Estimated disk usage: 50–100 GB depending on ERA5 variable coverage.
+* Set USE_GOOGLE_DRIVE = True if Colab local disk is too small.
+* First-run streaming will be slow (~hours); subsequent runs reuse cached files.
+* For paper-quality results also increase EPOCHS (16–32) and BATCH_SIZE.
+
+Demo-mode numbers remain pipeline-validation only.
 Report ONLY real-mode metrics as ChaosBench benchmark scores.
 """
